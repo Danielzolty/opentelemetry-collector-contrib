@@ -36,6 +36,7 @@ func TestMetricsBuilderConfig(t *testing.T) {
 					PostgresqlCommits:                  MetricConfig{Enabled: true},
 					PostgresqlConnectionMax:            MetricConfig{Enabled: true},
 					PostgresqlDatabaseCount:            MetricConfig{Enabled: true},
+					PostgresqlDatabaseLocks:            MetricConfig{Enabled: true},
 					PostgresqlDbSize:                   MetricConfig{Enabled: true},
 					PostgresqlDeadlocks:                MetricConfig{Enabled: true},
 					PostgresqlIndexScans:               MetricConfig{Enabled: true},
@@ -50,6 +51,7 @@ func TestMetricsBuilderConfig(t *testing.T) {
 					PostgresqlTableVacuumCount:         MetricConfig{Enabled: true},
 					PostgresqlTempFiles:                MetricConfig{Enabled: true},
 					PostgresqlWalAge:                   MetricConfig{Enabled: true},
+					PostgresqlWalDelay:                 MetricConfig{Enabled: true},
 					PostgresqlWalLag:                   MetricConfig{Enabled: true},
 				},
 				ResourceAttributes: ResourceAttributesConfig{
@@ -73,6 +75,7 @@ func TestMetricsBuilderConfig(t *testing.T) {
 					PostgresqlCommits:                  MetricConfig{Enabled: false},
 					PostgresqlConnectionMax:            MetricConfig{Enabled: false},
 					PostgresqlDatabaseCount:            MetricConfig{Enabled: false},
+					PostgresqlDatabaseLocks:            MetricConfig{Enabled: false},
 					PostgresqlDbSize:                   MetricConfig{Enabled: false},
 					PostgresqlDeadlocks:                MetricConfig{Enabled: false},
 					PostgresqlIndexScans:               MetricConfig{Enabled: false},
@@ -87,6 +90,7 @@ func TestMetricsBuilderConfig(t *testing.T) {
 					PostgresqlTableVacuumCount:         MetricConfig{Enabled: false},
 					PostgresqlTempFiles:                MetricConfig{Enabled: false},
 					PostgresqlWalAge:                   MetricConfig{Enabled: false},
+					PostgresqlWalDelay:                 MetricConfig{Enabled: false},
 					PostgresqlWalLag:                   MetricConfig{Enabled: false},
 				},
 				ResourceAttributes: ResourceAttributesConfig{
