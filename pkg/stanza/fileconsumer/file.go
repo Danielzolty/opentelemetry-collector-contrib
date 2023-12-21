@@ -6,17 +6,25 @@ package fileconsumer // import "github.com/open-telemetry/opentelemetry-collecto
 import (
 	"context"
 	"fmt"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/stanza/fileconsumer/internal/checkpoint"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/stanza/fileconsumer/internal/fingerprint"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/stanza/fileconsumer/internal/reader"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/stanza/fileconsumer/matcher"
+	"go.opentelemetry.io/collector/featuregate"
 	"os"
 	"sync"
 	"time"
 
 	"go.uber.org/zap"
 
-	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/stanza/fileconsumer/internal/checkpoint"
-	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/stanza/fileconsumer/internal/fingerprint"
-	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/stanza/fileconsumer/internal/reader"
-	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/stanza/fileconsumer/matcher"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/stanza/operator"
+)
+
+var hashingSolutionGate = featuregate.GlobalRegistry().MustRegister(
+	"pkg.stanza.operator.HashingSolution",
+	featuregate.StageAlpha,
+	featuregate.WithRegisterDescription("Controls whether fingerprint bytes are hashed into file storage"),
+	featuregate.WithRegisterReferenceURL("https://github.com/open-telemetry/opentelemetry-collector-contrib/issues/29617"),
 )
 
 type Manager struct {
@@ -34,6 +42,7 @@ type Manager struct {
 
 	previousPollFiles []*reader.Reader
 	knownFiles        []*reader.Metadata
+	featureGate       bool
 
 	// This value approximates the expected number of files which we will find in a single poll cycle.
 	// It is updated each poll cycle using a simple moving average calculation which assigns 20% weight
@@ -44,6 +53,11 @@ type Manager struct {
 }
 
 func (m *Manager) Start(persister operator.Persister) error {
+	if hashingSolutionGate.IsEnabled() {
+		m.featureGate = true
+	} else {
+		m.featureGate = false
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	m.cancel = cancel
 
@@ -56,7 +70,7 @@ func (m *Manager) Start(persister operator.Persister) error {
 
 	if persister != nil {
 		m.persister = persister
-		offsets, err := checkpoint.Load(ctx, m.persister)
+		offsets, err := checkpoint.Load(ctx, m.persister, hashingSolutionGate.IsEnabled())
 		if err != nil {
 			return fmt.Errorf("read known files from database: %w", err)
 		}
@@ -89,7 +103,7 @@ func (m *Manager) Stop() error {
 	m.wg.Wait()
 	m.closePreviousFiles()
 	if m.persister != nil {
-		if err := checkpoint.Save(context.Background(), m.persister, m.knownFiles); err != nil {
+		if err := checkpoint.Save(context.Background(), m.persister, m.knownFiles, hashingSolutionGate.IsEnabled()); err != nil {
 			m.Errorw("save offsets", zap.Error(err))
 		}
 	}
@@ -155,7 +169,7 @@ func (m *Manager) poll(ctx context.Context) {
 		for _, r := range m.previousPollFiles {
 			allCheckpoints = append(allCheckpoints, r.Metadata)
 		}
-		if err := checkpoint.Save(context.Background(), m.persister, allCheckpoints); err != nil {
+		if err := checkpoint.Save(context.Background(), m.persister, allCheckpoints, hashingSolutionGate.IsEnabled()); err != nil {
 			m.Errorw("save offsets", zap.Error(err))
 		}
 	}
@@ -188,7 +202,7 @@ func (m *Manager) makeFingerprint(path string) (*fingerprint.Fingerprint, *os.Fi
 		return nil, nil
 	}
 
-	fp, err := m.readerFactory.NewFingerprint(file)
+	fp, err := m.readerFactory.NewFingerprint(file, m.featureGate)
 	if err != nil {
 		if err = file.Close(); err != nil {
 			m.Debugw("problem closing file", zap.Error(err))
@@ -196,12 +210,24 @@ func (m *Manager) makeFingerprint(path string) (*fingerprint.Fingerprint, *os.Fi
 		return nil, nil
 	}
 
-	if fp.BytesUsed == 0 {
-		// Empty file, don't read it until we can compare its fingerprint
-		if err = file.Close(); err != nil {
-			m.Debugw("problem closing file", zap.Error(err))
+	if m.featureGate == true {
+		var fingerPrint fingerprint.FingerprintHash = (*fp).(fingerprint.FingerprintHash)
+		if fingerPrint.ByteSize() == 0 {
+			// Empty file, don't read it until we can compare its fingerprint
+			if err = file.Close(); err != nil {
+				m.Debugw("problem closing file", zap.Error(err))
+			}
+			return nil, nil
 		}
-		return nil, nil
+	} else {
+		var fingerPrint fingerprint.FingerprintBytes = (*fp).(fingerprint.FingerprintBytes)
+		if fingerPrint.ByteSize() == 0 {
+			// Empty file, don't read it until we can compare its fingerprint
+			if err = file.Close(); err != nil {
+				m.Debugw("problem closing file", zap.Error(err))
+			}
+			return nil, nil
+		}
 	}
 	return fp, file
 }
@@ -220,16 +246,32 @@ OUTER:
 
 		// Exclude duplicate paths with the same content. This can happen when files are
 		// being rotated with copy/truncate strategy. (After copy, prior to truncate.)
-		for _, r := range readers {
-			if fp.Equal(r.Fingerprint) {
-				if err := file.Close(); err != nil {
-					m.Debugw("problem closing file", zap.Error(err))
+		if m.featureGate == true {
+			var fingerPrint fingerprint.FingerprintHash = (*fp).(fingerprint.FingerprintHash)
+			for _, r := range readers {
+				if fingerPrint.Equal(*(r.Fingerprint)) {
+					if err := file.Close(); err != nil {
+						m.Debugw("problem closing file", zap.Error(err))
+					}
+					continue OUTER
 				}
-				continue OUTER
+			}
+		} else {
+			var fingerPrint fingerprint.FingerprintBytes = (*fp).(fingerprint.FingerprintBytes)
+			for _, r := range readers {
+				if fingerPrint.Equal(*(r.Fingerprint)) {
+					if err := file.Close(); err != nil {
+						m.Debugw("problem closing file", zap.Error(err))
+					}
+					continue OUTER
+				}
 			}
 		}
 
 		r, err := m.newReader(file, fp)
+		if m.featureGate == true {
+			r.SetFeatureGate()
+		}
 		if err != nil {
 			m.Errorw("Failed to create reader", zap.Error(err))
 			continue
@@ -242,23 +284,47 @@ OUTER:
 
 func (m *Manager) newReader(file *os.File, fp *fingerprint.Fingerprint) (*reader.Reader, error) {
 	// Check previous poll cycle for match
-	for i := 0; i < len(m.previousPollFiles); i++ {
-		oldReader := m.previousPollFiles[i]
-		if fp.StartsWith(oldReader.Fingerprint) {
-			// Keep the new reader and discard the old. This ensures that if the file was
-			// copied to another location and truncated, our handle is updated.
-			m.previousPollFiles = append(m.previousPollFiles[:i], m.previousPollFiles[i+1:]...)
-			return m.readerFactory.NewReaderFromMetadata(file, oldReader.Close())
+	if m.featureGate == true {
+		var fingerPrint fingerprint.FingerprintHash = (*fp).(fingerprint.FingerprintHash)
+		for i := 0; i < len(m.previousPollFiles); i++ {
+			oldReader := m.previousPollFiles[i]
+			if fingerPrint.StartsWith(*(oldReader.Fingerprint)) {
+				// Keep the new reader and discard the old. This ensures that if the file was
+				// copied to another location and truncated, our handle is updated.
+				m.previousPollFiles = append(m.previousPollFiles[:i], m.previousPollFiles[i+1:]...)
+				return m.readerFactory.NewReaderFromMetadata(file, oldReader.Close())
+			}
 		}
-	}
 
-	// Iterate backwards to match newest first
-	for i := len(m.knownFiles) - 1; i >= 0; i-- {
-		oldMetadata := m.knownFiles[i]
-		if fp.StartsWith(oldMetadata.Fingerprint) {
-			// Remove the old metadata from the list. We will keep updating it and save it again later.
-			m.knownFiles = append(m.knownFiles[:i], m.knownFiles[i+1:]...)
-			return m.readerFactory.NewReaderFromMetadata(file, oldMetadata)
+		// Iterate backwards to match newest first
+		for i := len(m.knownFiles) - 1; i >= 0; i-- {
+			oldMetadata := m.knownFiles[i]
+			if fingerPrint.StartsWith(*(oldMetadata.Fingerprint)) {
+				// Remove the old metadata from the list. We will keep updating it and save it again later.
+				m.knownFiles = append(m.knownFiles[:i], m.knownFiles[i+1:]...)
+				return m.readerFactory.NewReaderFromMetadata(file, oldMetadata)
+			}
+		}
+	} else {
+		var fingerPrint fingerprint.FingerprintBytes = (*fp).(fingerprint.FingerprintBytes)
+		for i := 0; i < len(m.previousPollFiles); i++ {
+			oldReader := m.previousPollFiles[i]
+			if fingerPrint.StartsWith(*(oldReader.Fingerprint)) {
+				// Keep the new reader and discard the old. This ensures that if the file was
+				// copied to another location and truncated, our handle is updated.
+				m.previousPollFiles = append(m.previousPollFiles[:i], m.previousPollFiles[i+1:]...)
+				return m.readerFactory.NewReaderFromMetadata(file, oldReader.Close())
+			}
+		}
+
+		// Iterate backwards to match newest first
+		for i := len(m.knownFiles) - 1; i >= 0; i-- {
+			oldMetadata := m.knownFiles[i]
+			if fingerPrint.StartsWith(*(oldMetadata.Fingerprint)) {
+				// Remove the old metadata from the list. We will keep updating it and save it again later.
+				m.knownFiles = append(m.knownFiles[:i], m.knownFiles[i+1:]...)
+				return m.readerFactory.NewReaderFromMetadata(file, oldMetadata)
+			}
 		}
 	}
 

@@ -8,6 +8,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/stanza/fileconsumer/emit"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/stanza/fileconsumer/internal/fingerprint"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/stanza/fileconsumer/internal/header"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/stanza/fileconsumer/internal/scanner"
 	"hash/fnv"
 	"os"
 	"time"
@@ -15,10 +19,6 @@ import (
 	"go.uber.org/zap"
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/stanza/decode"
-	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/stanza/fileconsumer/emit"
-	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/stanza/fileconsumer/internal/fingerprint"
-	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/stanza/fileconsumer/internal/header"
-	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/stanza/fileconsumer/internal/scanner"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/stanza/flush"
 )
 
@@ -46,6 +46,7 @@ type Metadata struct {
 type Reader struct {
 	*Config
 	*Metadata
+	featureGate   bool
 	fileName      string
 	logger        *zap.SugaredLogger
 	file          *os.File
@@ -54,6 +55,10 @@ type Reader struct {
 	decoder       *decode.Decoder
 	headerReader  *header.Reader
 	processFunc   emit.Callback
+}
+
+func (r *Reader) SetFeatureGate() {
+	r.featureGate = true
 }
 
 // offsetToEnd sets the starting offset
@@ -70,7 +75,10 @@ func (r *Reader) NewFingerprintFromFile() (*fingerprint.Fingerprint, error) {
 	if r.file == nil {
 		return nil, errors.New("file is nil")
 	}
-	return fingerprint.New(r.file, r.FingerprintSize)
+	if r.featureGate == true {
+		return fingerprint.NewFingerprintHash(r.file, r.FingerprintSize)
+	}
+	return fingerprint.NewFingerprintBytes(r.file, r.FingerprintSize)
 }
 
 // ReadToEnd will read until the end of the file
@@ -165,36 +173,55 @@ func (r *Reader) Close() *Metadata {
 func (r *Reader) Read(dst []byte) (int, error) {
 	// Skip if fingerprint is already built
 	// or if fingerprint is behind Offset
-	if r.Fingerprint.IsMaxSize(r.FingerprintSize, r.Offset) {
-		return r.file.Read(dst)
-	}
-	n, err := r.file.Read(dst)
-	appendCount := min0(n, r.FingerprintSize-int(r.Offset))
-	// return for n == 0 or r.Offset >= r.FingerprintSize
-	if appendCount == 0 {
+	if r.featureGate == true {
+		var fp fingerprint.FingerprintHash = (*r.Fingerprint).(fingerprint.FingerprintHash)
+		if fp.IsMaxSize(r.FingerprintSize, r.Offset) {
+			return r.file.Read(dst)
+		}
+		n, err := r.file.Read(dst)
+		appendCount := min0(n, r.FingerprintSize-int(r.Offset))
+		// return for n == 0 or r.Offset >= r.FingerprintSize
+		if appendCount == 0 {
+			return n, err
+		}
+
+		// for appendCount==0, the following code would add `0` to fingerprint
+		if fp.FirstBytes == nil {
+			fp.FirstBytes = dst[:appendCount]
+		} else {
+			fp.FirstBytes = append(fp.FirstBytes[:r.Offset], dst[:appendCount]...)
+		}
+		if fp.HashInstance == nil {
+			h := fnv.New64()
+			h.Write(fp.FirstBytes)
+			hashed := h.Sum64()
+			fp.HashInstance = &h
+			fp.HashBytes = hashed
+		} else {
+			hashInstance := *fp.HashInstance
+			hashInstance.Write(fp.FirstBytes[fp.BytesUsed:len(fp.FirstBytes)])
+			fp.HashBytes = hashInstance.Sum64()
+		}
+		fp.BytesUsed = len(fp.FirstBytes)
+
+		return n, err
+	} else {
+		var fp fingerprint.FingerprintBytes = (*r.Fingerprint).(fingerprint.FingerprintBytes)
+		if len(fp.FirstBytes) == r.FingerprintSize || int(r.Offset) > len(fp.FirstBytes) {
+			return r.file.Read(dst)
+		}
+		n, err := r.file.Read(dst)
+		appendCount := min0(n, r.FingerprintSize-int(r.Offset))
+		// return for n == 0 or r.Offset >= r.fingerprintSize
+		if appendCount == 0 {
+			return n, err
+		}
+
+		// for appendCount==0, the following code would add `0` to fingerprint
+		fp.FirstBytes = append(fp.FirstBytes[:r.Offset], dst[:appendCount]...)
 		return n, err
 	}
 
-	// for appendCount==0, the following code would add `0` to fingerprint
-	if r.Fingerprint.FirstBytes == nil {
-		r.Fingerprint.FirstBytes = dst[:appendCount]
-	} else {
-		r.Fingerprint.FirstBytes = append(r.Fingerprint.FirstBytes[:r.Offset], dst[:appendCount]...)
-	}
-	if r.Fingerprint.HashInstance == nil {
-		h := fnv.New64()
-		h.Write(r.Fingerprint.FirstBytes)
-		hashed := h.Sum64()
-		r.Fingerprint.HashInstance = &h
-		r.Fingerprint.HashBytes = hashed
-	} else {
-		hashInstance := *r.Fingerprint.HashInstance
-		hashInstance.Write(r.Fingerprint.FirstBytes[r.Fingerprint.BytesUsed:len(r.Fingerprint.FirstBytes)])
-		r.Fingerprint.HashBytes = hashInstance.Sum64()
-	}
-	r.Fingerprint.BytesUsed = len(r.Fingerprint.FirstBytes)
-
-	return n, err
 }
 
 func min0(a, b int) int {
@@ -216,12 +243,26 @@ func (r *Reader) Validate() bool {
 	if r.file == nil {
 		return false
 	}
-	refreshedFingerprint, err := fingerprint.New(r.file, r.FingerprintSize)
-	if err != nil {
+	if r.featureGate == true {
+		refreshedFingerprint, err := fingerprint.NewFingerprintHash(r.file, r.FingerprintSize)
+		if err != nil {
+			return false
+		}
+		var fp fingerprint.FingerprintHash = (*refreshedFingerprint).(fingerprint.FingerprintHash)
+		if fp.StartsWith(*(r.Fingerprint)) {
+			return true
+		}
+		return false
+	} else {
+		refreshedFingerprint, err := fingerprint.NewFingerprintBytes(r.file, r.FingerprintSize)
+		if err != nil {
+			return false
+		}
+		var fp fingerprint.FingerprintBytes = (*refreshedFingerprint).(fingerprint.FingerprintBytes)
+		if fp.StartsWith(*(r.Fingerprint)) {
+			return true
+		}
 		return false
 	}
-	if refreshedFingerprint.StartsWith(r.Fingerprint) {
-		return true
-	}
-	return false
+
 }

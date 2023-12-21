@@ -8,9 +8,9 @@ package fileconsumer // import "github.com/open-telemetry/opentelemetry-collecto
 
 import (
 	"context"
-	"sync"
-
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/stanza/fileconsumer/internal/fingerprint"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/stanza/fileconsumer/internal/reader"
+	"sync"
 )
 
 // Take care of files which disappeared from the pattern since the last poll cycle
@@ -21,8 +21,16 @@ func (m *Manager) preConsume(ctx context.Context, newReaders []*reader.Reader) {
 OUTER:
 	for _, oldReader := range m.previousPollFiles {
 		for _, newReader := range newReaders {
-			if newReader.Fingerprint.StartsWith(oldReader.Fingerprint) {
-				continue OUTER
+			if m.featureGate == true {
+				var fp1 fingerprint.FingerprintHash = (*newReader.Fingerprint).(fingerprint.FingerprintHash)
+				if fp1.StartsWith(*(oldReader.Fingerprint)) {
+					continue OUTER
+				}
+			} else {
+				var fp1 fingerprint.FingerprintBytes = (*newReader.Fingerprint).(fingerprint.FingerprintBytes)
+				if fp1.StartsWith(*(oldReader.Fingerprint)) {
+					continue OUTER
+				}
 			}
 
 			if !newReader.NameEquals(oldReader) {

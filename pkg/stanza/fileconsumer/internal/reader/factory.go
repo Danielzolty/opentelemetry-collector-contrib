@@ -5,6 +5,8 @@ package reader // import "github.com/open-telemetry/opentelemetry-collector-cont
 
 import (
 	"bufio"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/stanza/fileconsumer/internal/fingerprint"
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/stanza/fileconsumer/internal/header"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -15,8 +17,6 @@ import (
 
 	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/stanza/attrs"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/stanza/decode"
-	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/stanza/fileconsumer/internal/fingerprint"
-	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/stanza/fileconsumer/internal/header"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/stanza/flush"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/stanza/trim"
 )
@@ -31,8 +31,11 @@ type Factory struct {
 	TrimFunc      trim.Func
 }
 
-func (f *Factory) NewFingerprint(file *os.File) (*fingerprint.Fingerprint, error) {
-	return fingerprint.New(file, f.Config.FingerprintSize)
+func (f *Factory) NewFingerprint(file *os.File, featuregate bool) (*fingerprint.Fingerprint, error) {
+	if featuregate == true {
+		return fingerprint.NewFingerprintHash(file, f.Config.FingerprintSize)
+	}
+	return fingerprint.NewFingerprintBytes(file, f.Config.FingerprintSize)
 }
 
 func (f *Factory) NewReader(file *os.File, fp *fingerprint.Fingerprint) (*Reader, error) {

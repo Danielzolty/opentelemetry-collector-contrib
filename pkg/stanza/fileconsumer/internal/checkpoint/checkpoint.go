@@ -9,15 +9,16 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-
+	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/stanza/fileconsumer/internal/fingerprint"
 	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/stanza/fileconsumer/internal/reader"
+
 	"github.com/open-telemetry/opentelemetry-collector-contrib/pkg/stanza/operator"
 )
 
 const knownFilesKey = "knownFiles"
 
 // Save syncs the most recent set of files to the database
-func Save(ctx context.Context, persister operator.Persister, rmds []*reader.Metadata) error {
+func Save(ctx context.Context, persister operator.Persister, rmds []*reader.Metadata, featureGate bool) error {
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
 
@@ -29,21 +30,30 @@ func Save(ctx context.Context, persister operator.Persister, rmds []*reader.Meta
 	var errs []error
 	// Encode each known file
 	for _, rmd := range rmds {
-		if rmd != nil {
-			fingerPrint := rmd.Fingerprint.Copy()
-			fingerPrint.FirstBytes = nil
-			fingerPrint.HashInstance = nil
-			meta := &reader.Metadata{
-				Fingerprint:     fingerPrint,
-				Offset:          rmd.Offset,
-				FileAttributes:  rmd.FileAttributes,
-				HeaderFinalized: rmd.HeaderFinalized,
-				FlushState:      rmd.FlushState,
+		if featureGate == true {
+			if rmd != nil {
+				var fp fingerprint.Fingerprint = *rmd.Fingerprint
+				var fingerPrint fingerprint.Fingerprint = *(fp.(fingerprint.FingerprintHash).Copy())
+				var fPrint fingerprint.FingerprintHash = fingerPrint.(fingerprint.FingerprintHash)
+				fPrint.FirstBytes = nil
+				fPrint.HashInstance = nil
+				var f fingerprint.Fingerprint = fPrint
+				meta := &reader.Metadata{
+					Fingerprint:     &f,
+					Offset:          rmd.Offset,
+					FileAttributes:  rmd.FileAttributes,
+					HeaderFinalized: rmd.HeaderFinalized,
+					FlushState:      rmd.FlushState,
+				}
+				if err := enc.Encode(meta); err != nil {
+					errs = append(errs, fmt.Errorf("encode metadata: %w", err))
+				}
+
 			}
-			if err := enc.Encode(meta); err != nil {
+		} else {
+			if err := enc.Encode(rmd); err != nil {
 				errs = append(errs, fmt.Errorf("encode metadata: %w", err))
 			}
-
 		}
 
 	}
@@ -56,7 +66,7 @@ func Save(ctx context.Context, persister operator.Persister, rmds []*reader.Meta
 }
 
 // Load loads the most recent set of files to the database
-func Load(ctx context.Context, persister operator.Persister) ([]*reader.Metadata, error) {
+func Load(ctx context.Context, persister operator.Persister, featureGate bool) ([]*reader.Metadata, error) {
 	encoded, err := persister.Get(ctx, knownFilesKey)
 	if err != nil {
 		return nil, err
@@ -82,8 +92,12 @@ func Load(ctx context.Context, persister operator.Persister) ([]*reader.Metadata
 		if err = dec.Decode(rmd); err != nil {
 			return nil, err
 		}
-		if rmd.Fingerprint.HashBytes == 0 && rmd.Fingerprint.BytesUsed == 0 {
-			rmd.Fingerprint.AddHash()
+		if featureGate == true {
+			var fp fingerprint.Fingerprint = *rmd.Fingerprint
+			var fingerPrint fingerprint.FingerprintHash = fp.(fingerprint.FingerprintHash)
+			if fingerPrint.HashBytes == 0 && (*rmd.Fingerprint).(fingerprint.FingerprintHash).BytesUsed == 0 {
+				fingerPrint.AddHash()
+			}
 		}
 		// Migrate readers that used FileAttributes.HeaderAttributes
 		// This block can be removed in a future release, tentatively v0.90.0
